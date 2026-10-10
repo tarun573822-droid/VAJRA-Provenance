@@ -1,0 +1,5 @@
+state/
+demo-output/
+.env
+node_modules/
+*.pem

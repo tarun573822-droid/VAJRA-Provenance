@@ -1,0 +1,25 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {Vault} from '../src/core.mjs';
+import {visible,embed,extract} from '../src/watermark.mjs';
+import {seal,unseal,keys,valid} from '../src/crypto.mjs';
+const text='SYNTHETIC: exercise document. No real defence data.';
+function fixture(t){const dir=fs.mkdtempSync(path.join(os.tmpdir(),'vajra-test-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const v=new Vault(dir);v.init();v.distribute('briefing',text);return v;}
+test('native PQ envelope roundtrip and wrong key rejection',()=>{const a=keys('ml-kem-768'),b=keys('ml-kem-768'),box=seal(Buffer.from(text),a.publicKey,{doc:'1'});assert.equal(unseal(box,a.privateKey,{doc:'1'}).toString(),text);assert.throws(()=>unseal(box,b.privateKey,{doc:'1'}));assert.throws(()=>unseal(box,a.privateKey,{doc:'2'}));});
+test('watermark is invisible in stripped rendering and reversible',()=>{const s='a'.repeat(32),m=embed(text,s);assert.equal(visible(m),text);assert.equal(extract(m),s);assert.throws(()=>extract(text));});
+test('unique sessions, recipient attribution and signed acknowledgement',t=>{const v=fixture(t),a=v.open('briefing','alice','alice-device'),b=v.open('briefing','bob','bob-device');assert.notEqual(a,b);assert.equal(visible(a),visible(b));const r=v.investigate(a);assert.equal(r.recipient,'alice');assert.equal(r.acknowledged,true);assert.equal(v.verify().length,4);});
+test('unauthorized recipient and device mismatch blocked',t=>{const v=fixture(t);assert.throws(()=>v.open('briefing','mallory','mallory-device'),/denied/);assert.throws(()=>v.open('briefing','alice','bob-device'),/denied/);assert.equal(v.verify().length,0);});
+test('revocation blocks future release',t=>{const v=fixture(t);v.revoke('alice');assert.throws(()=>v.open('briefing','alice','alice-device'),/denied/);});
+test('expired authority blocked',t=>{const v=fixture(t);assert.throws(()=>v.release('briefing','alice','alice-device',{expiresAt:'2000-01-01T00:00:00Z'}),/expired/);});
+test('quorum failure prevents output and ledger mutation',t=>{const v=fixture(t);v.offline=new Set([0,1]);assert.throws(()=>v.release('briefing','alice','alice-device'),/quorum unavailable/);assert.equal(v.checkpoint().height,0);});
+test('one paused validator tolerated',t=>{const v=fixture(t);v.offline=new Set([0]);assert.equal(v.investigate(v.open('briefing','alice','alice-device')).recipient,'alice');});
+test('session replay blocked',t=>{const v=fixture(t),session='1'.repeat(32);v.release('briefing','alice','alice-device',{session});assert.throws(()=>v.release('briefing','alice','alice-device',{session}),/replay/);});
+test('one corrupt replica tolerated, two corrupt replicas rejected',t=>{const v=fixture(t);v.open('briefing','alice','alice-device');fs.writeFileSync(v.p('replicas','0.json'),'[]');assert.equal(v.verify().length,2);fs.writeFileSync(v.p('replicas','1.json'),'[]');assert.throws(()=>v.verify(),/intact replicas/);});
+test('all replicas truncated cannot match independently pinned checkpoint',t=>{const v=fixture(t);v.open('briefing','alice','alice-device');const pin=v.checkpoint();for(let i=0;i<4;i++)fs.writeFileSync(v.p('replicas',i+'.json'),'[]');assert.throws(()=>v.verify(v.trust(),pin),/intact replicas/);});
+test('watermark transplantation and changed content are inconclusive',t=>{const v=fixture(t),m=v.open('briefing','alice','alice-device');assert.throws(()=>v.investigate('Altered '+m),/changed/);assert.throws(()=>v.investigate(visible(m)),/inconclusive/);});
+test('modified signature fails verification',t=>{const v=fixture(t),p=v.release('briefing','alice','alice-device'),e=p.receipt.body.event;assert.equal(valid({...e.record,device:'forged'},e.recipientSignature,v.trust().identities.alice.sign),false);});
+test('wrong recipient and tampered envelope denied',t=>{const v=fixture(t),p=v.release('briefing','alice','alice-device');assert.throws(()=>v.receive(p,'bob'),/Wrong recipient/);p.encrypted.tag=Buffer.alloc(16).toString('base64');assert.throws(()=>v.receive(p,'alice'));});
+test('unsafe identifiers and reserved watermark input rejected',t=>{const v=fixture(t);assert.throws(()=>v.release('../trust','alice','alice-device'),/identifier/);assert.throws(()=>embed('reserved\u200b','1'.repeat(32)),/reserved/);});
